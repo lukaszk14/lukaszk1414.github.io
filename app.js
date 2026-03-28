@@ -244,45 +244,149 @@ async function loadFinanse(){
 }
 
 /* ─── PALIWA ──────────────────────────────────────────── */
+/* ── PALIWA ────────────────────────────────────────────
+   Źródła kaskadowo:
+   1. cenypaliw.fyi  — ORLEN + GUS, codziennie, parsowanie JSON embedded
+   2. e-petrol.pl    — fallback HTML scraping
+   3. Dane statyczne — ostateczny fallback z ostrzeżeniem
+─────────────────────────────────────────────────────── */
+const FUEL_LS = 'dash_fuel_v5';
+
+function fuelHtml(prices, source){
+  return prices.map(p=>`
+    <div class="fuel-item">
+      <div class="fuel-left">
+        <div class="fuel-name">${p.name}</div>
+        <div class="fuel-unit">${p.unit||'zł/litr'} · ${p.type||'hurtowa ORLEN'}</div>
+      </div>
+      <div class="fuel-price">${p.price}</div>
+    </div>`).join('')
+  + `<div class="fuel-note">Źródło: ${source}</div>`;
+}
+
 async function loadFuel(){
   const box=$('#fuelBody'); if(!box) return;
-  try{
-    const proxy='https://api.allorigins.win/raw?url=';
-    const res=await fetch(proxy+encodeURIComponent('https://www.e-petrol.pl/benzyna/srednie-ceny-paliw'));
-    if(!res.ok) throw new Error();
-    const html=await res.text();
-    const prices=parseFuelPrices(html);
-    if(!prices.length) throw new Error('no data');
-    box.innerHTML=prices.map(p=>`
-      <div class="fuel-item">
-        <div class="fuel-left">
-          <div class="fuel-name">${p.name}</div>
-          <div class="fuel-unit">zł/litr · śr. PL</div>
-        </div>
-        <div class="fuel-price">${p.price}</div>
-      </div>`).join('')
-      +`<div class="fuel-note">Źródło: e-petrol.pl</div>`;
-  }catch{
-    box.innerHTML=`
-      <div class="fuel-item"><div class="fuel-left"><div class="fuel-name">Pb95</div><div class="fuel-unit">zł/l · est.</div></div><div class="fuel-price">~6.45</div></div>
-      <div class="fuel-item"><div class="fuel-left"><div class="fuel-name">Pb98</div><div class="fuel-unit">zł/l · est.</div></div><div class="fuel-price">~7.05</div></div>
-      <div class="fuel-item"><div class="fuel-left"><div class="fuel-name">Diesel</div><div class="fuel-unit">zł/l · est.</div></div><div class="fuel-price">~6.55</div></div>
-      <div class="fuel-item"><div class="fuel-left"><div class="fuel-name">LPG</div><div class="fuel-unit">zł/l · est.</div></div><div class="fuel-price">~3.05</div></div>
-      <div class="fuel-note">⚠ Dane szacunkowe — brak połączenia</div>
-    `;
+
+  // Pokaż dane z cache natychmiast (żeby nie było pustego kafelka)
+  const cached = (() => { try{ return JSON.parse(localStorage.getItem(FUEL_LS)); }catch{} })();
+  if(cached?.prices?.length){
+    box.innerHTML = fuelHtml(cached.prices, cached.source + ' · cache');
   }
+
+  const proxy = 'https://api.allorigins.win/raw?url=';
+
+  // ── Źródło 1: cenypaliw.fyi ──────────────────────────
+  try{
+    const res = await fetch(proxy + encodeURIComponent('https://cenypaliw.fyi/'), {cache:'no-store'});
+    if(!res.ok) throw new Error('cenypaliw.fyi ' + res.status);
+    const html = await res.text();
+
+    // Strona osadza dane jako JSON w tagu <script>
+    // Szukamy wzorca: {"pb95":X.XX,"pb98":X.XX,"on":X.XX ...}
+    let prices = [];
+
+    // Próba 1 — JSON z danymi paliw w skrypcie Next.js / inline
+    const jsonMatch = html.match(/"pb95"\s*:\s*([\d.]+).*?"pb98"\s*:\s*([\d.]+).*?"on"\s*:\s*([\d.]+)/s)
+                   || html.match(/"PB95"\s*:\s*([\d.]+).*?"PB98"\s*:\s*([\d.]+).*?"ON"\s*:\s*([\d.]+)/s);
+    if(jsonMatch){
+      prices = [
+        {name:'Pb 95',  price: parseFloat(jsonMatch[1]).toFixed(2), type:'ORLEN z VAT'},
+        {name:'Pb 98',  price: parseFloat(jsonMatch[2]).toFixed(2), type:'ORLEN z VAT'},
+        {name:'Diesel', price: parseFloat(jsonMatch[3]).toFixed(2), type:'ORLEN z VAT'},
+      ];
+    }
+
+    // Próba 2 — parsowanie widocznych wartości z tabeli/kafelków
+    if(!prices.length){
+      prices = parseCenypaliw(html);
+    }
+
+    if(prices.length >= 2){
+      localStorage.setItem(FUEL_LS, JSON.stringify({prices, source:'cenypaliw.fyi', ts: Date.now()}));
+      box.innerHTML = fuelHtml(prices, 'cenypaliw.fyi · ORLEN');
+      return;
+    }
+    throw new Error('cenypaliw: no prices parsed');
+  }catch(e){ console.warn('Paliwo [1/cenypaliw]:', e.message); }
+
+  // ── Źródło 2: e-petrol.pl ────────────────────────────
+  try{
+    const res = await fetch(proxy + encodeURIComponent('https://www.e-petrol.pl/benzyna/srednie-ceny-paliw'), {cache:'no-store'});
+    if(!res.ok) throw new Error('e-petrol ' + res.status);
+    const html  = await res.text();
+    const prices = parseEpetrol(html);
+    if(prices.length >= 2){
+      localStorage.setItem(FUEL_LS, JSON.stringify({prices, source:'e-petrol.pl', ts: Date.now()}));
+      box.innerHTML = fuelHtml(prices, 'e-petrol.pl · GUS');
+      return;
+    }
+    throw new Error('e-petrol: no prices');
+  }catch(e){ console.warn('Paliwo [2/e-petrol]:', e.message); }
+
+  // ── Fallback: dane statyczne ──────────────────────────
+  const fallback = [
+    {name:'Pb 95',  price:'7.03', type:'est. ORLEN'},
+    {name:'Pb 98',  price:'7.71', type:'est. ORLEN'},
+    {name:'Diesel', price:'8.66', type:'est. ORLEN'},
+    {name:'LPG',    price:'~3.10', type:'est.'},
+  ];
+  box.innerHTML = fuelHtml(fallback, '⚠ dane szacunkowe (brak połączenia)');
 }
-function parseFuelPrices(html){
-  const prices=[];
-  const patterns=[
-    {name:'Pb95',  re:/(?:Pb\s*95|benzyna\s*95|E5)[^0-9]*(\d[\d,\.]{3,6})/i},
-    {name:'Pb98',  re:/(?:Pb\s*98|benzyna\s*98|E10)[^0-9]*(\d[\d,\.]{3,6})/i},
-    {name:'Diesel',re:/(?:olej\s*napędowy|diesel|ON\b)[^0-9]*(\d[\d,\.]{3,6})/i},
-    {name:'LPG',   re:/(?:LPG|autogaz)[^0-9]*(\d[\d,\.]{3,6})/i},
+
+function parseCenypaliw(html){
+  // cenypaliw.fyi — szukamy bloków z cenami w formacie "X.XX PLN/l"
+  // Strona ma elementy jak: PB 95 ... 5.71 PLN/l ... PB 98 ... 6.27 PLN/l ... ON ... 7.04 PLN/l
+  const prices = [];
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+
+  // Szukamy tekstu zawierającego ceny — sprawdzamy różne selektory
+  const bodyText = doc.body?.innerText || doc.body?.textContent || html;
+
+  const patterns = [
+    // z VAT (wyższe, bardziej realistyczne dla stacji)
+    { name:'Pb 95',  re:/PB?\s*95[^0-9]{0,30}?([\d]+[.,][\d]{2})\s*PLN\/l/i,       type:'z VAT' },
+    { name:'Pb 98',  re:/PB?\s*98[^0-9]{0,30}?([\d]+[.,][\d]{2})\s*PLN\/l/i,       type:'z VAT' },
+    { name:'Diesel', re:/\bON\b[^0-9]{0,20}?([\d]+[.,][\d]{2})\s*PLN\/l/i,         type:'z VAT' },
+    // bez VAT (hurtowa)
+    { name:'Pb 95',  re:/benzyn[ay]\s*95[^0-9]{0,30}?([\d]+[.,][\d]{2})/i,          type:'hurtowa' },
+    { name:'Diesel', re:/olej\s*nap[ęe]dowy[^0-9]{0,30}?([\d]+[.,][\d]{2})/i,      type:'hurtowa' },
+    // liczbowe z kontekstu tytułu strony  np. "benzyna PB95 7.03, diesel ON 8.66"
+    { name:'Pb 95',  re:/PB95\s+([\d]+[.,][\d]{2})/i,                               type:'z VAT' },
+    { name:'Diesel', re:/ON\s+([\d]+[.,][\d]{2})/i,                                 type:'z VAT' },
+  ];
+
+  for(const p of patterns){
+    if(prices.find(x=>x.name===p.name)) continue; // już mamy tę nazwę
+    const m = bodyText.match(p.re) || html.match(p.re);
+    if(!m) continue;
+    const v = parseFloat(m[1].replace(',','.'));
+    if(v >= 3 && v <= 15) prices.push({name:p.name, price:v.toFixed(2), type:p.type});
+  }
+
+  // Parsuj też z tytułu strony — np. "benzyna PB95 7.03, diesel ON 8.66 zł/l"
+  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  if(titleMatch){
+    const title = titleMatch[1];
+    const t95  = title.match(/PB95\s+([\d.]+)/i);
+    const tON  = title.match(/(?:diesel\s+ON|ON)\s+([\d.]+)/i);
+    if(t95  && !prices.find(x=>x.name==='Pb 95'))  { const v=parseFloat(t95[1]);  if(v>3&&v<15) prices.push({name:'Pb 95', price:v.toFixed(2), type:'z VAT'}); }
+    if(tON  && !prices.find(x=>x.name==='Diesel')) { const v=parseFloat(tON[1]);  if(v>3&&v<15) prices.push({name:'Diesel',price:v.toFixed(2), type:'z VAT'}); }
+  }
+
+  return prices;
+}
+
+function parseEpetrol(html){
+  const prices = [];
+  const patterns = [
+    {name:'Pb 95',  re:/(?:Pb\s*95|benzyna\s*95|Eurosuper\s*95)[^\d]{0,40}?(\d[\d,\.]{3,6})/i},
+    {name:'Pb 98',  re:/(?:Pb\s*98|benzyna\s*98|Super\s*Plus\s*98)[^\d]{0,40}?(\d[\d,\.]{3,6})/i},
+    {name:'Diesel', re:/(?:olej\s*nap[ęe]dowy|diesel|Ekodiesel)[^\d]{0,40}?(\d[\d,\.]{3,6})/i},
+    {name:'LPG',    re:/(?:LPG|autogaz)[^\d]{0,40}?(\d[\d,\.]{3,6})/i},
   ];
   for(const p of patterns){
-    const m=html.match(p.re);
-    if(m){ const v=parseFloat(m[1].replace(',','.')); if(v>1&&v<25) prices.push({name:p.name,price:v.toFixed(2)}); }
+    const m = html.match(p.re);
+    if(m){ const v=parseFloat(m[1].replace(',','.')); if(v>3&&v<15) prices.push({name:p.name, price:v.toFixed(2), type:'śr. PL'}); }
   }
   return prices;
 }
